@@ -45,6 +45,8 @@ class Api:
         add("GET", "/api/stations", self._stations)
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
+        add("GET", "/api/arbiters", self._arbiters)
+        add("GET", "/api/arbiter/{name}", self._arbiter_one)
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
@@ -71,6 +73,8 @@ class Api:
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
+        add("POST", "/api/arbiter/command", self._arbiter_command)
+        add("POST", "/api/arbiter/advance", self._arbiter_advance)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/trip", self._trip)
@@ -156,6 +160,12 @@ class Api:
             "count": len(names),
             "valves": [self._platform.service.valve(name).snapshot().as_dict() for name in names],
         }
+
+    def _arbiters(self, params: dict, body: dict) -> dict:
+        return {"arbiters": self._platform.arbiter_report()}
+
+    def _arbiter_one(self, params: dict, body: dict) -> dict:
+        return self._platform.arbiter_report(str(params.get("name", "")))
 
     def _curve(self, params: dict, body: dict) -> dict:
         payload = self._platform.curve_report()
@@ -318,6 +328,23 @@ class Api:
         stations = body.get("stations")
         selected = None if not stations else [str(item) for item in stations]
         return self._platform.replay_valves(selected)
+
+    def _arbiter_command(self, params: dict, body: dict) -> dict:
+        command_id = body.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            raise PlantError("command_id 必须是非空字符串", component="valve-arbiter")
+        return self._platform.arbitrate(
+            str(body.get("station", "")),
+            _as_float(body, "target_pct", 0.0),
+            str(body.get("source", "")),
+            command_id,
+        )
+
+    def _arbiter_advance(self, params: dict, body: dict) -> dict:
+        return self._platform.advance_arbiters(
+            _as_float(body, "seconds", 0.0),
+            _as_float(body, "step_s", 0.1),
+        )
 
     def _pump(self, params: dict, body: dict) -> dict:
         action = str(body.get("action", "cycle"))

@@ -75,6 +75,16 @@ class Valve:
         self._moves += 1
         return self._position_pct
 
+    def align_to_target(self) -> float:
+        """把开度对齐到当前目标（不新增动作计数）。
+
+        行程走完瞬间的到位确认用：细粒度推进下开度本来就已停在目标，粗粒度
+        跳时则用它把内存开度补齐，两者都不应再多记一次动作。
+        """
+
+        self._position_pct = self._target_pct
+        return self._position_pct
+
     def step(self, dt: float) -> float:
         """按行程速率向目标开度推进一个步长。"""
 

@@ -16,6 +16,7 @@ packages = [
     "heatnet.ns",
     "heatnet.store",
     "heatnet.audit",
+    "heatnet.arbiter",
     "heatnet.source",
     "heatnet.station",
     "heatnet.primary",

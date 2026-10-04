@@ -11,6 +11,9 @@ from __future__ import annotations
 import dataclasses
 import threading
 
+from .arbiter.arbiter import ValveArbiter
+from .arbiter.driver import ValveCommand
+from .arbiter.factory import build_arbiter
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
@@ -104,6 +107,11 @@ class Platform:
 
         self.stations, self.valves, self.queues = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
+        # 每只混水阀一个执行权仲裁器：三路写方统一收口，凭据走总线进审计。
+        self.arbiters: dict[str, ValveArbiter] = {
+            name: build_arbiter(valve, self.clock, self.bus, self.durable)
+            for name, valve in self.valves.items()
+        }
         self.pump: Pump = self._build_pump()
 
         self.meters = QuotaAccumulator()
@@ -555,6 +563,70 @@ class Platform:
             commands = [queue.enqueue(target, source) for target in targets]
             return {"station": station, "queued": [command.as_dict() for command in commands]}
 
+    def arbitrate(
+        self, station: str, target_pct: float, source: str, command_id: str
+    ) -> dict:
+        """把一路调阀指令提交给该站混水阀的执行权仲裁器。
+
+        分区批量用 ``source="batch"``、值班员手动用 ``"manual"``、本地联锁用
+        ``"interlock"``；``command_id`` 由调用方保证全局唯一，同一标识并发或
+        重复提交只会有一次生效，其余拿到 ``duplicate`` 裁决凭据。
+        """
+
+        if station not in self.arbiters:
+            raise PlantError(f"未知换热站 {station!r}", component="valve-arbiter")
+        with self._lock:
+            command = ValveCommand(command_id, source, float(target_pct))
+            verdict = self.arbiters[station].submit(command)
+            self._persist()
+            return {"station": station, "verdict": verdict, **verdict}
+
+    def advance_arbiters(self, seconds: float = 0.0, step_s: float = 0.1) -> dict:
+        """推进各阀仲裁器时间线；``seconds=0`` 时只按当前时刻处理到期。"""
+
+        with self._lock:
+            if seconds > 0:
+                reports = {
+                    name: arbiter.advance(seconds, step_s)
+                    for name, arbiter in self.arbiters.items()
+                }
+            else:
+                reports = {
+                    name: arbiter.tick() for name, arbiter in self.arbiters.items()
+                }
+            return {
+                "ok": True,
+                "advanced": seconds,
+                "verdicts": {
+                    name: [item["event"] for item in items]
+                    for name, items in reports.items()
+                    if items
+                },
+            }
+
+    def arbiter_report(self, station: str | None = None) -> dict:
+        """返回一个或全部混水阀仲裁器的执行权状态与裁决凭据（控制台展示用）。"""
+
+        with self._lock:
+            if station is not None:
+                if station not in self.arbiters:
+                    raise PlantError(f"未知换热站 {station!r}", component="valve-arbiter")
+                arbiter = self.arbiters[station]
+                return {
+                    "station": station,
+                    "idle": arbiter.is_idle(),
+                    **arbiter.status(),
+                    "verdicts": arbiter.verdicts(50),
+                }
+            return {
+                name: {
+                    "idle": arbiter.is_idle(),
+                    **arbiter.status(),
+                    "verdicts": arbiter.verdicts(50),
+                }
+                for name, arbiter in sorted(self.arbiters.items())
+            }
+
     def collect_heat(self, meter: str, delta_mwh: float) -> dict:
         """采集一次热量并记进本期总账。"""
 
@@ -633,8 +705,21 @@ class Platform:
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
             self.trend.append("pressure_kpa", moment, self.secondary.pressure_kpa())
+            # 推进各阀执行权仲裁：阀位按行程走、到期动作走完、排队放行或过期。
+            arbiter_events = {
+                name: [item["event"] for item in arbiter.tick() if item["event"] != "complete"]
+                for name, arbiter in self.arbiters.items()
+            }
             self._persist()
-            return {"cycle": self._cycles, **report}
+            arbiter_events = {
+                name: [item["event"] for item in arbiter.tick() if item["event"] != "complete"]
+                for name, arbiter in self.arbiters.items()
+            }
+            result = {"cycle": self._cycles, **report}
+            result["arbiters"] = {
+                name: events for name, events in arbiter_events.items() if events
+            }
+            return result
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测热源调整与热量采集的原子性。
@@ -812,6 +897,17 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "arbiters": {
+                name: {
+                    "holder": status["holder"],
+                    "waiting": status["waiting"],
+                    "counts": status["counts"],
+                    "last_digest": status["last_digest"],
+                }
+                for name, status in (
+                    (name, self.arbiters[name].status()) for name in sorted(self.arbiters)
+                )
+            },
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
