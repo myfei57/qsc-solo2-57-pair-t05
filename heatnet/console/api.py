@@ -45,6 +45,9 @@ class Api:
         add("GET", "/api/stations", self._stations)
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
+        add("GET", "/api/valve/{name}/arbitration", self._valve_arbitration)
+        add("POST", "/api/valve/arbitrate", self._arbitrate_valve)
+        add("POST", "/api/valve/arbitrate-zone", self._arbitrate_zone)
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
@@ -156,6 +159,34 @@ class Api:
             "count": len(names),
             "valves": [self._platform.service.valve(name).snapshot().as_dict() for name in names],
         }
+
+    def _valve_arbitration(self, params: dict, body: dict) -> dict:
+        name = str(params.get("name", ""))
+        arbiter = self._platform.arbiters[name]
+        return {
+            "snapshot": arbiter.snapshot(),
+            "verdicts": arbiter.verdicts(limit=int(params.get("limit", 100))),
+        }
+
+    def _arbitrate_valve(self, params: dict, body: dict) -> dict:
+        command_id = body.get("command_id")
+        return self._platform.arbitrate_valve(
+            str(body.get("station", "")),
+            _as_float(body, "target_pct", 0.0),
+            str(body.get("source", "zone")),
+            None if command_id is None else str(command_id),
+            wait=bool(body.get("wait", True)),
+            timeout=_as_float(body, "timeout", 5.0),
+        )
+
+    def _arbitrate_zone(self, params: dict, body: dict) -> dict:
+        return self._platform.arbitrate_zone(
+            str(body.get("zone", "")),
+            _as_float(body, "target_pct", 0.0),
+            str(body.get("source", "zone")),
+            wait=bool(body.get("wait", True)),
+            timeout=_as_float(body, "timeout", 5.0),
+        )
 
     def _curve(self, params: dict, body: dict) -> dict:
         payload = self._platform.curve_report()

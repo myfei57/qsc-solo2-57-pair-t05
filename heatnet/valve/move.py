@@ -34,7 +34,12 @@ class ValveMove:
         }
 
 
-def move_valve(valve: Valve, durable: DurableState, target_pct: float) -> ValveMove:
+def move_valve(
+    valve: Valve,
+    durable: DurableState,
+    target_pct: float,
+    command: dict | None = None,
+) -> ValveMove:
     """把阀门开到目标开度：先落盘，落盘成功后再改内存。"""
 
     clamped = max(0.0, min(100.0, float(target_pct)))
@@ -43,6 +48,8 @@ def move_valve(valve: Valve, durable: DurableState, target_pct: float) -> ValveM
         "position_pct": round(clamped, 4),
         "moves": valve.moves() + 1,
     }
+    if command:
+        payload["command"] = dict(command)
     try:
         durable.save(f"valve/{valve.name}", payload)
     except StorageError:

@@ -49,7 +49,16 @@ from .store.state import DurableState
 from .temp.curve import HeatCurve
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
-from .valve.move import load_valve
+from .valve.arbiter import (
+    GRANTED,
+    QUEUED,
+    ArbitrationVerdict,
+    ValveArbiter,
+    ValveRequest,
+    ValveToken,
+    resolve_source,
+)
+from .valve.move import load_valve, move_valve
 from .valve.queue import ValveCommandQueue, replay_queue
 from .valve.valve import Valve
 
@@ -103,6 +112,15 @@ class Platform:
         self.mapping = StationMapping(self.zones)
 
         self.stations, self.valves, self.queues = self._build_stations()
+        self.arbiters = {
+            name: ValveArbiter(
+                valve.name,
+                listener=lambda verdict, station=name: self._publish_valve_verdict(station, verdict),
+                time_func=self.clock.now,
+            )
+            for name, valve in self.valves.items()
+        }
+        self._valve_actuator_locks = {name: threading.Lock() for name in self.valves}
         self.service = StationService(self.stations, self.valves, self.durable)
         self.pump: Pump = self._build_pump()
 
@@ -197,6 +215,23 @@ class Platform:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
             return
+        for record in records:
+            if record.component != "valve" or not record.action.startswith("arbitration_"):
+                continue
+            station = str(record.asset)
+            if station not in self.arbiters or not str(record.payload.get("command_id", "")):
+                continue
+            status = record.action.removeprefix("arbitration_")
+            if status in ("granted", "queued"):
+                continue
+            self.arbiters[station].remember(
+                str(record.payload["command_id"]),
+                str(record.payload.get("source", "zone")),
+                float(record.payload.get("target_pct", 0.0)),
+                status,
+                seq=int(record.payload.get("request_seq", 0)),
+                ts_ns=int(record.ts * 1_000_000_000),
+            )
         trips = [item for item in records if item.action == "trip"]
         if trips:
             reason = str(trips[-1].payload.get("reason", "unknown"))
@@ -267,6 +302,34 @@ class Platform:
             )
         )
         return summary
+
+    def _publish_valve_verdict(self, station: str, verdict: ArbitrationVerdict) -> None:
+        """把阀门裁决凭据发布给审计日志。"""
+
+        request = verdict.request
+        valve = self.valves[station].name
+        severity = "alarm" if verdict.decision in ("preempted", "voided", "duplicate") else "notice"
+        self.bus.publish(
+            Event.of(
+                "valve",
+                "valve",
+                f"arbitration_{verdict.decision}",
+                asset=station,
+                severity=severity,
+                message=f"阀门执行权裁决：{verdict.decision}",
+                valve=valve,
+                verdict_id=verdict.verdict_id,
+                decision=verdict.decision,
+                reason=verdict.reason,
+                command_id=request.command_id,
+                source=request.source,
+                source_kind=request.policy.name,
+                priority=request.policy.priority,
+                target_pct=round(request.target_pct, 4),
+                request_seq=request.seq,
+                request_status=request.status,
+            )
+        )
 
     # ---- 生命周期 -----------------------------------------------------
 
@@ -545,6 +608,123 @@ class Platform:
                 "applied": {item["queue"]: item["applied"] for item in reports},
             }
 
+    def arbitrate_valve(
+        self,
+        station: str,
+        target_pct: float,
+        source: str = "zone",
+        command_id: str | None = None,
+        *,
+        wait: bool = True,
+        timeout: float = 5.0,
+    ) -> dict:
+        """按来源优先级申请一只混水阀的执行权，获批后执行一次开度调整。"""
+
+        if station not in self.valves:
+            raise KeyError(f"换热站没有混水阀: {station}")
+        source_decision = resolve_source(source)
+        with self._lock:
+            op_id = self.ids.next()
+            identifier = str(command_id) if command_id else f"{station}/{op_id}"
+            valve = self.valves[station]
+            arbiter = self.arbiters[station]
+
+            def move(request: ValveRequest, token: ValveToken):
+                token.raise_if_cancelled()
+                with self._valve_actuator_locks[station]:
+                    token.raise_if_cancelled()
+                    command = {
+                        "id": request.command_id,
+                        "source": request.source,
+                        "priority": request.policy.priority,
+                        "verdict_id": request.grant_verdict_id,
+                    }
+                    result = move_valve(
+                        valve,
+                        self.durable,
+                        request.target_pct,
+                        command=command,
+                    )
+                    token.raise_if_cancelled()
+                return result.as_dict()
+
+            verdict = arbiter.submit(identifier, source_decision.source, target_pct, move)
+
+        if wait and verdict.decision in (GRANTED, QUEUED):
+            arbiter.wait(verdict.request.command_id, timeout=timeout)
+        final_request = arbiter.request(identifier)
+        completed = verdict.decision in (GRANTED, QUEUED) and final_request["status"] == "completed"
+        accepted = verdict.decision in (GRANTED, QUEUED)
+        audit = self.audit.entries(limit=20)
+        final_decision = (
+            final_request["status"]
+            if completed or final_request["status"] in ("voided", "preempted", "failed")
+            else verdict.decision
+        )
+        wanted_action = f"arbitration_{final_decision}"
+        credential = None
+        if verdict.decision in (GRANTED, QUEUED):
+            credential = next(
+                (
+                    item
+                    for item in audit
+                    if item["action"] == "arbitration_granted"
+                    and item["payload"].get("command_id") == identifier
+                ),
+                None,
+            )
+        if credential is None:
+            credential = next(
+                (
+                    item
+                    for item in audit
+                    if item["action"] == wanted_action and item["payload"].get("command_id") == identifier
+                ),
+                None,
+            )
+        return {
+            "ok": accepted,
+            "completed": completed,
+            "station": station,
+            "valve": valve.snapshot().as_dict(),
+            "source": source_decision.as_dict(),
+            "verdict": verdict.as_dict(),
+            "request": final_request,
+            "audit": credential,
+        }
+
+    def arbitrate_zone(
+        self,
+        zone: str,
+        target_pct: float,
+        source: str = "zone",
+        *,
+        wait: bool = True,
+        timeout: float = 5.0,
+    ) -> dict:
+        """按同一来源策略向一个分区的全部混水阀提交调节指令。"""
+
+        stations = self.mapping.stations_in(zone)
+        if not stations:
+            raise KeyError(f"分区不存在或没有换热站: {zone}")
+        reports = [
+            self.arbitrate_valve(
+                station,
+                target_pct,
+                source,
+                command_id=None,
+                wait=wait,
+                timeout=timeout,
+            )
+            for station in stations
+        ]
+        return {
+            "ok": all(item["ok"] for item in reports),
+            "zone": zone,
+            "stations": stations,
+            "reports": reports,
+        }
+
     def queue_commands(
         self, station: str, targets: list[float], source: str = "dispatch"
     ) -> dict:
@@ -806,6 +986,7 @@ class Platform:
                         "valve": self.valves[name].snapshot().as_dict(),
                         "queued": len(self.queues[name].commands()),
                         "applied": self.checkpoint.load(name),
+                        "arbitration": self.arbiters[name].snapshot(),
                     }
                     for name in sorted(self.stations)
                 },
